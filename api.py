@@ -274,137 +274,130 @@ async def analyze_asset(file: UploadFile = File(...)):
         return {"status": "error", "message": str(e)}
 
 @app.post("/local-db-search")
-async def local_db_search(file: UploadFile = File(...), use_ensemble: bool = True, use_multiscale: bool = True):
-    """
-    Enhanced database search with multiple matching strategies.
-
-    Args:
-        file: Image file to search
-        use_ensemble: Use augmented ensemble vectors (more robust)
-        use_multiscale: Use multi-scale analysis (better for resized images)
-    """
-    print(f"🔍 Starting Enhanced Supabase Search for {file.filename}...")
+async def local_db_search(file: UploadFile = File(...)):
+    """Search for similar images in the database."""
+    print(f"Searching database for {file.filename}...")
 
     image_bytes = await file.read()
-
-    # Get query vectors using selected methods
-    if use_ensemble:
-        query_vector = get_ensemble_vector(image_bytes)
-        query_vectors = {"ensemble": query_vector}
-    else:
-        query_vectors = get_five_vectors(image_bytes)
-
-    if use_multiscale:
-        multiscale = get_multi_scale_vectors(image_bytes)
-        query_vectors.update(multiscale)
-
-    # Region weights for scoring
-    region_weights = {
-        "full_image": 1.5,
-        "ensemble": 1.5,
-        "scale_100": 1.2,
-        "scale_75": 1.0,
-        "scale_50": 0.8,
-        "top_left": 0.9,
-        "top_right": 0.9,
-        "bottom_left": 0.9,
-        "bottom_right": 0.9
-    }
-
-    best_match = None
-    best_score = 0.0
-    best_region = None
-    all_matches = []
+    query_vector = get_clip_vector(image_bytes)
+    vector_string = "[" + ",".join(map(str, query_vector)) + "]"
 
     conn = get_db_connection()
     cursor = conn.cursor()
 
     try:
-        for region, vector in query_vectors.items():
-            vector_string = "[" + ",".join(map(str, vector)) + "]"
-            weight = region_weights.get(region, 1.0)
+        cursor.execute("""
+            SELECT artist_name, image_name, 1 - (visual_dna <=> %s) AS similarity
+            FROM protected_assets 
+            WHERE region = 'full_image'
+            ORDER BY similarity DESC
+            LIMIT 5;
+        """, (vector_string,))
 
-            cursor.execute("""
-                SELECT artist_name, image_name, region, 1 - (visual_dna <=> %s) AS match_score
-                FROM protected_assets
-                WHERE 1 - (visual_dna <=> %s) > 0.75
-                ORDER BY match_score DESC
-                LIMIT 5;
-            """, (vector_string, vector_string))
+        matches = cursor.fetchall()
 
-            matches = cursor.fetchall()
-            for match in matches:
-                weighted_score = match[3] * weight
-                all_matches.append({
-                    "artist": match[0],
-                    "image": match[1],
-                    "region": match[2],
-                    "score": match[3],
-                    "weighted_score": weighted_score,
-                    "query_region": region
-                })
+        if matches and matches[0][2] >= 0.95:
+            tier = "DEFINITE_MATCH"
+            action = "block_upload"
+        elif matches and matches[0][2] >= 0.85:
+            tier = "PROBABLE_MATCH"
+            action = "flag_for_review"
+        elif matches and matches[0][2] >= 0.75:
+            tier = "LOW_CONFIDENCE"
+            action = "proceed_to_web_search"
+        else:
+            tier = "NO_MATCH"
+            action = "proceed_to_web_search"
 
-                if weighted_score > best_score:
-                    best_score = weighted_score
-                    best_match = match
-                    best_region = region
+        if matches:
+            print(f"Match: {matches[0][0]} - {matches[0][1]} ({matches[0][2]*100:.1f}%)")
+            return {
+                "match_found": tier != "NO_MATCH",
+                "tier": tier,
+                "action": action,
+                "evidence": {
+                    "matched_artist": matches[0][0],
+                    "matched_file": matches[0][1],
+                    "confidence_score": round(matches[0][2] * 100, 2)
+                },
+                "candidates": [{"artist": m[0], "file": m[1], "score": round(m[2] * 100, 2)} for m in matches[:5]]
+            }
+        else:
+            return {
+                "match_found": False,
+                "tier": "NO_MATCH",
+                "action": "proceed_to_web_search",
+                "evidence": None
+            }
 
-        # Sort all matches by weighted score
-        all_matches.sort(key=lambda x: x["weighted_score"], reverse=True)
-
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
     finally:
         cursor.close()
         release_db_connection(conn)
 
-    # Tiered decision with more granular thresholds
-    if best_match and best_score >= 0.75:
-        if best_score >= 0.95:
-            tier = "DEFINITE_MATCH"
-            action = "block_upload"
-        elif best_score >= 0.90:
-            tier = "HIGH_CONFIDENCE"
-            action = "block_upload"
-        elif best_score >= 0.85:
-            tier = "PROBABLE_MATCH"
-            action = "flag_for_review"
-        elif best_score >= 0.80:
-            tier = "MODERATE_MATCH"
-            action = "flag_for_review"
-        else:
-            tier = "LOW_CONFIDENCE"
-            action = "proceed_with_caution"
+@app.post("/register-art")
+async def register_art(
+    artist_name: str = Form(...),
+    file: UploadFile = File(...)
+):
+    """Register new artwork."""
+    print(f"Registering new art for {artist_name}: {file.filename}...")
 
-        track_request("/local-db-search", match_found=True, confidence=best_score, artist=best_match[0])
-        analytics_data["top_matched_artists"][best_match[0]] += 1
+    try:
+        image_bytes = await file.read()
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-        print(f"🚨 Match Found ({tier}) in {best_region}!")
+        conn = get_db_connection()
+        cursor = conn.cursor()
 
+        full_vector = get_clip_vector(image_bytes)
+        vector_string = "[" + ",".join(map(str, full_vector)) + "]"
+
+        # Check for duplicate
+        cursor.execute("""
+            SELECT artist_name, image_name, 1 - (visual_dna <=> %s) AS similarity
+            FROM protected_assets 
+            WHERE region = 'full_image'
+            AND 1 - (visual_dna <=> %s) > 0.98
+            LIMIT 1;
+        """, (vector_string, vector_string))
+        duplicate = cursor.fetchone()
+        if duplicate:
+            cursor.close()
+            release_db_connection(conn)
+            return {
+                "status": "error",
+                "message": "Duplicate image already registered",
+                "duplicate_of": duplicate[0],
+                "similarity": round(duplicate[1] * 100, 2)
+            }
+
+        # Save single vector
+        cursor.execute("""
+            INSERT INTO protected_assets (artist_name, image_name, region, visual_dna, created_at)
+            VALUES (%s, %s, %s, %s, NOW())
+            RETURNING id;
+        """, (artist_name, file.filename, "full_image", vector_string))
+
+        asset_id = cursor.fetchone()[0]
+        conn.commit()
+        cursor.close()
+        release_db_connection(conn)
+
+        print(f"Registered {file.filename} for {artist_name}!")
         return {
-            "match_found": True,
-            "tier": tier,
-            "action": action,
-            "primary_region": best_region,
-            "confidence_score": round(best_score * 100, 2),
-            "evidence": {
-                "matched_artist": best_match[0],
-                "matched_file": best_match[1],
-                "matched_region": best_match[2],
-                "raw_score": round(best_match[3] * 100, 2)
-            },
-            "all_matches": all_matches[:10],  # Top 10 matches
-            "total_candidates": len(all_matches)
+            "status": "success",
+            "message": f"Secured {file.filename} for {artist_name}.",
+            "asset_id": asset_id
         }
-    else:
-        track_request("/local-db-search", match_found=False)
-        print("✅ No matches in Supabase.")
 
-        return {
-            "match_found": False,
-            "tier": "NO_MATCH",
-            "action": "proceed_to_web_search",
-            "evidence": None,
-            "candidates_checked": len(all_matches)
-        }
+    except Exception as e:
+        print(f"Error: {e}")
+        return {"status": "error", "message": str(e)}
+    finally:
+        cursor.close()
+        release_db_connection(conn)
 
 @app.post("/register-art")
 async def register_art(
@@ -431,37 +424,39 @@ async def register_art(
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        regions_saved = []
+        # Use single full image vector only
+        full_vector = get_clip_vector(image_bytes)
+        vector_string = "[" + ",".join(map(str, full_vector)) + "]"
 
-        # Get 5-region vectors
-        vectors = get_five_vectors(image_bytes)
+        # Check for exact duplicate
+        cursor.execute("""
+            SELECT artist_name, image_name, 1 - (visual_dna <=> %s) AS similarity
+            FROM protected_assets 
+            WHERE region = 'full_image'
+            AND 1 - (visual_dna <=> %s) > 0.98
+            ORDER BY similarity DESC
+            LIMIT 1;
+        """, (vector_string, vector_string))
+        duplicate = cursor.fetchone()
+        if duplicate:
+            cursor.close()
+            release_db_connection(conn)
+            return {
+                "status": "error",
+                "message": "Duplicate image already registered",
+                "duplicate_of": duplicate[0],
+                "similarity": round(duplicate[1] * 100, 2)
+            }
 
-        for region_name, vector in vectors.items():
-            vector_string = "[" + ",".join(map(str, vector)) + "]"
+        # Save single vector
+        cursor.execute("""
+            INSERT INTO protected_assets (artist_name, image_name, region, visual_dna, created_at)
+            VALUES (%s, %s, %s, %s, NOW())
+            RETURNING id;
+        """, (artist_name, file.filename, "full_image", vector_string))
 
-            cursor.execute("""
-                INSERT INTO protected_assets (artist_name, image_name, region, visual_dna, created_at)
-                VALUES (%s, %s, %s, %s, NOW())
-                RETURNING id;
-            """, (artist_name, file.filename, region_name, vector_string))
-
-            asset_id = cursor.fetchone()[0]
-            regions_saved.append(f"{region_name}(id:{asset_id})")
-
-            # Optionally save augmented versions
-            if include_augmented:
-                augmentations = ["flip_h", "rotate_15", "brightness_up"]
-                for aug_type in augmentations:
-                    aug_img = augment_image(img, [aug_type])[0][0]
-                    img_byte_arr = io.BytesIO()
-                    aug_img.save(img_byte_arr, format='JPEG')
-                    aug_vector = get_clip_vector(img_byte_arr.getvalue())
-                    aug_vector_str = "[" + ",".join(map(str, aug_vector)) + "]"
-
-                    cursor.execute("""
-                        INSERT INTO protected_assets (artist_name, image_name, region, visual_dna, is_augmented, created_at)
-                        VALUES (%s, %s, %s, %s, TRUE, NOW())
-                    """, (artist_name, f"{file.filename}_{aug_type}", f"{region_name}_{aug_type}", aug_vector_str))
+        asset_id = cursor.fetchone()[0]
+        regions_saved = [f"full_image(id:{asset_id})"]
 
         # Save metadata if provided
         if metadata:
@@ -481,13 +476,11 @@ async def register_art(
 
         analytics_data["total_registrations"] += 1
 
-        print(f"✅ Successfully locked vectors into the Supabase Vault!")
+        print(f"✅ Successfully registered {file.filename} for {artist_name}!")
         return {
             "status": "success",
-            "message": f"Secured {file.filename} across {len(regions_saved)} regions for {artist_name}.",
-            "regions_saved": regions_saved,
-            "augmented_versions": len(regions_saved) * 3 if include_augmented else 0,
-            "total_vectors_stored": len(regions_saved) * (4 if include_augmented else 1)
+            "message": f"Secured {file.filename} for {artist_name}.",
+            "asset_id": asset_id
         }
 
     except Exception as e:
