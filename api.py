@@ -275,54 +275,79 @@ async def analyze_asset(file: UploadFile = File(...)):
 
 @app.post("/local-db-search")
 async def local_db_search(file: UploadFile = File(...)):
-    """Search for similar images in the database."""
+    """Search using 5 vectors (full + 4 quadrants), register matching region if duplicate found."""
     print(f"Searching database for {file.filename}...")
 
     image_bytes = await file.read()
-    query_vector = get_clip_vector(image_bytes)
-    vector_string = "[" + ",".join(map(str, query_vector)) + "]"
+    
+    # Get 5 vectors (full + 4 quadrants)
+    query_vectors = get_five_vectors(image_bytes)
+    vector_string_map = {k: "[" + ",".join(map(str, v)) + "]" for k, v in query_vectors.items()}
 
     conn = get_db_connection()
     cursor = conn.cursor()
 
+    best_match = None
+    best_score = 0.0
+    best_region = None
+
     try:
-        cursor.execute("""
-            SELECT artist_name, image_name, 1 - (visual_dna <=> %s) AS similarity
-            FROM protected_assets 
-            WHERE region = 'full_image'
-            ORDER BY similarity DESC
-            LIMIT 5;
-        """, (vector_string,))
+        # Search all 5 regions
+        for region_name, vec_str in vector_string_map.items():
+            cursor.execute("""
+                SELECT artist_name, image_name, 1 - (visual_dna <=> %s) AS similarity
+                FROM protected_assets 
+                WHERE 1 - (visual_dna <=> %s) > 0.80
+                ORDER BY similarity DESC
+                LIMIT 1;
+            """, (vec_str, vec_str))
+            
+            match = cursor.fetchone()
+            if match and match[2] > best_score:
+                best_score = match[2]
+                best_match = match
+                best_region = region_name
 
-        matches = cursor.fetchall()
-
-        if matches and matches[0][2] >= 0.95:
+        # Decision tiers
+        if best_match and best_score >= 0.95:
             tier = "DEFINITE_MATCH"
             action = "block_upload"
-        elif matches and matches[0][2] >= 0.85:
+        elif best_match and best_score >= 0.85:
             tier = "PROBABLE_MATCH"
             action = "flag_for_review"
-        elif matches and matches[0][2] >= 0.75:
+        elif best_match and best_score >= 0.80:
             tier = "LOW_CONFIDENCE"
             action = "proceed_to_web_search"
         else:
             tier = "NO_MATCH"
             action = "proceed_to_web_search"
 
-        if matches:
-            print(f"Match: {matches[0][0]} - {matches[0][1]} ({matches[0][2]*100:.1f}%)")
+        if best_match:
+            print(f"Match: {best_match[0]} - {best_match[1]} ({best_score*100:.1f}%) in {best_region}")
             return {
                 "match_found": tier != "NO_MATCH",
                 "tier": tier,
                 "action": action,
+                "region": best_region,
                 "evidence": {
-                    "matched_artist": matches[0][0],
-                    "matched_file": matches[0][1],
-                    "confidence_score": round(matches[0][2] * 100, 2)
-                },
-                "candidates": [{"artist": m[0], "file": m[1], "score": round(m[2] * 100, 2)} for m in matches[:5]]
+                    "matched_artist": best_match[0],
+                    "matched_file": best_match[1],
+                    "confidence_score": round(best_score * 100, 2)
+                }
             }
         else:
+            # No match found - store full_image vector anyway
+            print("No match, storing full_image vector")
+            full_vec = query_vectors.get("full_image")
+            if full_vec:
+                vec_str = "[" + ",".join(map(str, full_vec)) + "]"
+                cursor.execute("""
+                    INSERT INTO protected_assets (artist_name, image_name, region, visual_dna, created_at)
+                    VALUES (%s, %s, %s, %s, NOW())
+                    RETURNING id;
+                """, ("auto_register", file.filename, "full_image", vec_str))
+                conn.commit()
+            
             return {
                 "match_found": False,
                 "tier": "NO_MATCH",
