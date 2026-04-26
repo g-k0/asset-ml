@@ -740,5 +740,76 @@ async def startup_event():
     init_db_pool()
     print("✅ All systems ready!")
 
+@app.post("/ingest")
+async def ingest(
+    artist_name: str = Form(...),
+    file: UploadFile = File(...)
+):
+    """Ingest a new image - search first, then register if no duplicate."""
+    print(f"📥 Ingesting {file.filename} for {artist_name}...")
+    
+    try:
+        image_bytes = await file.read()
+        
+        # Search using 5 vectors
+        query_vectors = get_five_vectors(image_bytes)
+        vector_string_map = {k: "[" + ",".join(map(str, v)) + "]" for k, v in query_vectors.items()}
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Search all regions
+        best_score = 0.0
+        best_match = None
+        
+        for region_name, vec_str in vector_string_map.items():
+            cursor.execute("""
+                SELECT artist_name, image_name, 1 - (visual_dna <=> %s) AS similarity
+                FROM protected_assets 
+                WHERE 1 - (visual_dna <=> %s) > 0.80
+                ORDER BY similarity DESC
+                LIMIT 1;
+            """, (vec_str, vec_str))
+            
+            match = cursor.fetchone()
+            if match and match[2] > best_score:
+                best_score = match[2]
+                best_match = match
+        
+        if best_match and best_score >= 0.85:
+            # Duplicate found
+            cursor.close()
+            release_db_connection(conn)
+            return {
+                "status": "duplicate",
+                "action": "skipped",
+                "similar_to": best_match[0],
+                "confidence": round(best_score * 100, 2)
+            }
+        
+        # No duplicate - register full_image vector
+        if not best_match or best_score < 0.85:
+            full_vec = query_vectors.get("full_image")
+            if full_vec:
+                vec_str = "[" + ",".join(map(str, full_vec)) + "]"
+                cursor.execute("""
+                    INSERT INTO protected_assets (artist_name, image_name, region, visual_dna, created_at)
+                    VALUES (%s, %s, %s, %s, NOW())
+                """, (artist_name, file.filename, "full_image", vec_str))
+                conn.commit()
+        
+        cursor.close()
+        release_db_connection(conn)
+        
+        return {
+            "status": "registered",
+            "filename": file.filename,
+            "artist": artist_name
+        }
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        return {"status": "error", "message": str(e)}
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
